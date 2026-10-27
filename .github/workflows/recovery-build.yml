@@ -1,0 +1,137 @@
+name: Ubuntu Touch recovery - build image
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  assemble:
+    name: Assemble Pixel Watch 2 Ubuntu Touch rootfs
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+
+    env:
+      DEVICE_ARTIFACT_URL: https://gitlab.com/ubports/porting/community-ports/android13/google-eos/google-eos/-/jobs/artifacts/main/download?job=build
+      DEVICEINFO_URL: https://gitlab.com/ubports/porting/community-ports/android13/google-eos/google-eos/-/raw/b9ff8948/deviceinfo
+      ROOTFS_URL: https://ci.ubports.com/job/ubuntu-touch-rootfs/job/ubports%252Ffocal/lastSuccessfulBuild/artifact/ubuntu-touch-android9plus-rootfs-armhf.tar.gz
+      OTA_CHANNEL: 20.04/armhf/android9plus/devel
+
+    steps:
+      - name: Checkout recovery project
+        uses: actions/checkout@v4
+
+      - name: Install image assembly tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            curl git wget jq unzip fakeroot xz-utils zstd e2fsprogs \
+            android-sdk-libsparse-utils
+          command -v img2simg
+          df -h .
+
+      - name: Fetch Pixel Watch 2 build artifacts and pinned deviceinfo
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          curl --fail --location --retry 3 --retry-delay 5 \
+            --output "$RUNNER_TEMP/eos-artifacts.zip" "$DEVICE_ARTIFACT_URL"
+          unzip -t "$RUNNER_TEMP/eos-artifacts.zip"
+          unzip -j -o "$RUNNER_TEMP/eos-artifacts.zip" \
+            out/device_eos.tar.xz -d out/
+          curl --fail --location --retry 3 \
+            --output deviceinfo "$DEVICEINFO_URL"
+
+          # The device kernel is AArch64, but this port deliberately uses ARMHF userspace.
+          source ./deviceinfo
+          test "$deviceinfo_codename" = eos
+          test "$deviceinfo_arch" = arm
+          test "$deviceinfo_kernel_arch" = aarch64
+          test "$deviceinfo_halium_version" = 13
+          tar -tJf out/device_eos.tar.xz | grep -Fx partitions/boot.img
+          tar -tJf out/device_eos.tar.xz | grep -Fx partitions/init_boot.img
+          sha256sum out/device_eos.tar.xz
+          df -h .
+
+      - name: Fetch UBports image assembly scripts
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 \
+            https://gitlab.com/ubports/porting/community-ports/halium-generic-adaptation-build-tools.git build
+          git -C build rev-parse HEAD
+          test -f build/prepare-fake-ota.sh
+          test -f build/system-image-from-ota.sh
+
+      - name: Assemble Ubuntu Touch 20.04 ARMHF image
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash build/prepare-fake-ota.sh out/device_eos.tar.xz ota
+          bash build/system-image-from-ota.sh ota/ubuntu_command out
+          test -s out/rootfs.img
+          mv out/rootfs.img out/ubuntu.img
+          test -s out/boot.img
+          test -s out/init_boot.img
+          file out/ubuntu.img
+          df -h .
+
+      - name: Compress and checksum flashable inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          zstd -T0 -12 -f out/ubuntu.img -o out/ubuntu.img.zst
+          zstd -t out/ubuntu.img.zst
+          sha256sum out/ubuntu.img.zst out/boot.img out/init_boot.img > out/SHA256SUMS
+          {
+            echo "UNTESTED Pixel Watch 2 Ubuntu Touch recovery image"
+            echo "Ubuntu Touch: 20.04 / armhf"
+            echo "Halium: 13 / arm32 generic"
+            echo "Kernel architecture: aarch64"
+            echo "Device: Google eos (Pixel Watch 2)"
+            echo "Deviceinfo source: b9ff8948"
+            echo "Device archive source: latest successful GitLab build artifact"
+            echo "Assembly scripts commit: $(git -C build rev-parse HEAD)"
+            echo "Actions run: https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            echo "DO NOT FLASH until the Android 13 base firmware and image layout are verified."
+          } > out/BUILD_NOTES.txt
+          cat out/SHA256SUMS
+          ls -lh out/ubuntu.img.zst out/boot.img out/init_boot.img
+          df -h .
+
+      - name: Preserve output as a draft GitHub Release
+        id: preserve
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="stage2-$GITHUB_RUN_ID"
+          gh release create "$tag" \
+            --draft --prerelease \
+            --title "Stage 2 Ubuntu Touch recovery - run $GITHUB_RUN_NUMBER" \
+            --notes-file out/BUILD_NOTES.txt \
+            out/ubuntu.img.zst \
+            out/boot.img \
+            out/init_boot.img \
+            out/SHA256SUMS \
+            out/BUILD_NOTES.txt
+
+      - name: Temporary artifact fallback if draft Release fails
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stage2-recovery-fallback
+          path: |
+            out/ubuntu.img.zst
+            out/boot.img
+            out/init_boot.img
+            out/SHA256SUMS
+            out/BUILD_NOTES.txt
+          if-no-files-found: warn
+          retention-days: 7
+          compression-level: 0
