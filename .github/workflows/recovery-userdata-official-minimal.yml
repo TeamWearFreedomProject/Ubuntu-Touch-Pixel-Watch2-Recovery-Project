@@ -1,0 +1,201 @@
+name: Ubuntu Touch recovery - Stage 3.3 minimal official userdata (UNSAFE NO AUTH)
+
+on:
+  workflow_dispatch:
+    inputs:
+      stage2_tag:
+        description: Draft Stage 2 tag containing ubuntu.img.zst
+        required: true
+        type: string
+        default: stage2-40430296102
+      acknowledge_open_ssh:
+        description: "DANGER: no password or client key needed to access SSH port 22"
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  userdata:
+    name: Create minimal eos userdata following official README layout
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Require acknowledgment of completely open SSH
+        shell: bash
+        env:
+          ACKNOWLEDGED: ${{ inputs.acknowledge_open_ssh }}
+        run: |
+          set -euo pipefail
+          if test "$ACKNOWLEDGED" != "true"; then
+            echo "::error::Open SSH is unsafe. Check acknowledge_open_ssh to build."
+            exit 1
+          fi
+
+      - name: Install utilities
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends e2fsprogs zstd openssh-client jq
+          command -v gh
+          command -v mkfs.ext4
+          command -v ssh-keygen
+
+      - name: Recover and verify existing Stage 2 rootfs
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          STAGE2_TAG: ${{ inputs.stage2_tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p stage2
+          releases="$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100")"
+          if ! jq -e --arg tag "$STAGE2_TAG" \
+              '.[] | select(.tag_name == $tag and .draft == true)' \
+              <<< "$releases" >/dev/null; then
+            echo "::error::Stage 2 draft release missing: $STAGE2_TAG"
+            exit 1
+          fi
+          for asset_name in ubuntu.img.zst SHA256SUMS; do
+            asset_id="$(jq -er --arg tag "$STAGE2_TAG" --arg name "$asset_name" \
+              '[.[] | select(.tag_name == $tag and .draft == true) | .assets[] | select(.name == $name) | .id] | first' \
+              <<< "$releases")"
+            curl --fail --location --retry 3 --retry-delay 5 \
+              --header 'Accept: application/octet-stream' \
+              --header "Authorization: Bearer $GH_TOKEN" \
+              --header 'X-GitHub-Api-Version: 2022-11-28' \
+              --output "stage2/$asset_name" \
+              "https://api.github.com/repos/$GITHUB_REPOSITORY/releases/assets/$asset_id"
+          done
+          test "$(stat -c %s stage2/ubuntu.img.zst)" -gt 200000000
+          expected="$(awk '$2=="out/ubuntu.img.zst" {print $1}' stage2/SHA256SUMS)"
+          actual="$(sha256sum stage2/ubuntu.img.zst | awk '{print $1}')"
+          test -n "$expected"
+          test "$expected" = "$actual"
+          zstd -t stage2/ubuntu.img.zst
+          zstd -d -f stage2/ubuntu.img.zst -o stage2/ubuntu.img
+          test "$(stat -c %s stage2/ubuntu.img)" -eq 3600000000
+
+      - name: Create official userdata tree and minimal no-auth overrides
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p stage2-mount \
+            userdata/user-data/phablet/.config/lomiri \
+            userdata/system-data/var/lib/extrausers \
+            userdata/system-data/etc/systemd/system/multi-user.target.wants \
+            userdata/system-data/etc/ssh/sshd_config.d \
+            userdata/system-data/etc/pam.d
+          sudo mount -t ext4 -o loop,ro,noload stage2/ubuntu.img stage2-mount
+          trap 'sudo umount stage2-mount' EXIT
+          for entry in passwd group shadow gshadow; do
+            test -f "stage2-mount/var/lib/extrausers/$entry"
+          done
+          sudo awk -F: '$1=="phablet" {if ($3!=32011) exit 1; found=1} END {if(!found) exit 1}' \
+            stage2-mount/var/lib/extrausers/passwd
+          test -f stage2-mount/usr/lib/systemd/system/ssh.service
+          test -f stage2-mount/etc/pam.d/common-auth
+          grep -Eq '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config.d/\*\.conf' \
+            stage2-mount/etc/ssh/sshd_config
+          sudo cp -a stage2-mount/var/lib/extrausers/. \
+            userdata/system-data/var/lib/extrausers/
+          sudo awk '
+            {
+              if ($0 ~ /^[[:space:]]*auth[[:space:]]/ && $0 ~ /pam_extrausers[.]so/) {
+                gsub(/nullok_secure/, "nullok")
+                if ($0 !~ /nullok/) sub(/pam_extrausers[.]so/, "pam_extrausers.so nullok")
+                found=1
+              }
+              print
+            }
+            END {if (!found) exit 3}
+          ' stage2-mount/etc/pam.d/common-auth > "$RUNNER_TEMP/common-auth-nullok"
+          sudo install -o 0 -g 0 -m 0644 "$RUNNER_TEMP/common-auth-nullok" \
+            userdata/system-data/etc/pam.d/common-auth
+          sudo umount stage2-mount
+          trap - EXIT
+
+          # Copy upstream google-eos README setup marker exactly.
+          printf 'Base-Name: ubuntu-sdk\nBase-Version: 20.04\n' \
+            > userdata/user-data/phablet/.config/lomiri/wizard-has-run
+
+          # This ONE symlink is how official google-eos README enables SSH.
+          # No ssh.socket, ordering drop-ins, or boot-time helper services.
+          ln -s /usr/lib/systemd/system/ssh.service \
+            userdata/system-data/etc/systemd/system/multi-user.target.wants/ssh.service
+
+          # Only deviations from official SSH key-auth flow:
+          # blank phablet UNIX password, no client public keys, permissive SSH.
+          printf '%s\n' \
+            'PasswordAuthentication yes' \
+            'PermitEmptyPasswords yes' \
+            'PubkeyAuthentication no' \
+            'KbdInteractiveAuthentication no' \
+            'PermitRootLogin no' \
+            'UsePAM yes' \
+            'AllowUsers phablet' \
+            'DisableForwarding yes' \
+            > userdata/system-data/etc/ssh/sshd_config.d/00-eos-noauth.conf
+
+          # A server host key is REQUIRED by SSH even without client auth.
+          # Generate at build-time to avoid changes to the systemd boot graph.
+          # This temporary artifact contains the private server host key.
+          ssh-keygen -q -t ed25519 -N '' \
+            -f userdata/system-data/etc/ssh/ssh_host_ed25519_key
+
+          sudo chown -R 0:0 userdata
+          sudo chown -R 32011:32011 userdata/user-data/phablet
+          sudo chmod 0600 userdata/system-data/etc/ssh/ssh_host_ed25519_key
+          sudo chmod 0644 userdata/system-data/etc/ssh/ssh_host_ed25519_key.pub
+          test ! -e userdata/user-data/phablet/.ssh/authorized_keys
+
+      - name: Remove UNIX password and make official-format ext4 userdata.img
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          shadow_file=userdata/system-data/var/lib/extrausers/shadow
+          sudo awk -F: -v OFS=: \
+            '$1=="phablet" {$2=""; found=1} {print} END {if(!found) exit 2}' \
+            "$shadow_file" > "$RUNNER_TEMP/shadow-noauth"
+          sudo install -o 0 -g "$(sudo stat -c %g "$shadow_file")" -m 0640 \
+            "$RUNNER_TEMP/shadow-noauth" "$shadow_file"
+          sudo awk -F: '$1=="phablet" {if ($2 != "") exit 1; found=1} END {if(!found) exit 1}' \
+            "$shadow_file"
+
+          # Exact ext4 feature switches and size from upstream README.
+          sudo mkfs.ext4 -F -O '^metadata_csum,^orphan_file' -m 0 \
+            -d userdata/ userdata.img 200M
+          sudo chown "$(id -u):$(id -g)" userdata.img
+          test "$(stat -c %s userdata.img)" -eq 209715200
+          e2fsck -fn userdata.img
+          sha256sum userdata.img > SHA256SUMS
+          printf '%s\n' \
+            'Stage 3.3 minimal official-layout eos userdata - UNSAFE NO-AUTH' \
+            'Same wizard marker, ssh.service symlink, and 200M ext4 as official README.' \
+            'No custom SSH systemd startup units or socket dependencies.' \
+            'phablet UNIX password empty, PAM nullok, no client SSH public key.' \
+            'SSH communication still encrypted; device server host key pre-generated.' \
+            'WARNING: The public GitHub Actions artifact contains a private server host key.' \
+            'WARNING: Anyone who reaches TCP port 22 can attempt unauthenticated phablet login.' \
+            'Use ONLY on isolated trusted Wi-Fi; do not port-forward TCP 22.' \
+            'Flashing userdata.img wipes watch userdata, apps, and Wi-Fi.' \
+            'Only flash after charging and verifying the target device.' \
+            'Image build success DOES NOT prove device boot or SSH works.' \
+            > README-USERDATA.txt
+          ls -lh userdata.img SHA256SUMS README-USERDATA.txt
+
+      - name: Upload short-lived userdata artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: eos-stage3-3-MINIMAL-NOAUTH-userdata
+          path: |
+            userdata.img
+            SHA256SUMS
+            README-USERDATA.txt
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 6
