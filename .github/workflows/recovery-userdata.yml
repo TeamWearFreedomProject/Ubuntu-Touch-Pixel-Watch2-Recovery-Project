@@ -1,0 +1,162 @@
+name: Ubuntu Touch recovery - prepare password-only SSH userdata
+
+on:
+  workflow_dispatch:
+    inputs:
+      stage2_tag:
+        description: "Draft Stage 2 release tag containing ubuntu.img.zst"
+        required: true
+        type: string
+        default: "stage2-40430296102"
+
+permissions:
+  contents: read
+
+jobs:
+  userdata:
+    name: Create password-only SSH userdata.img for eos
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    steps:
+      - name: Install ext4 and zstd utilities
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends e2fsprogs zstd openssl
+          command -v gh
+          command -v mkfs.ext4
+          df -h .
+
+      - name: Recover and verify Stage 2 Ubuntu image
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          STAGE2_TAG: ${{ inputs.stage2_tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p stage2
+          gh release download "$STAGE2_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern 'ubuntu.img.zst' --pattern 'SHA256SUMS' --dir stage2
+          test -s stage2/ubuntu.img.zst
+          test -s stage2/SHA256SUMS
+          expected="$(awk '$2=="out/ubuntu.img.zst" {print $1}' stage2/SHA256SUMS)"
+          test "${#expected}" -eq 64
+          actual="$(sha256sum stage2/ubuntu.img.zst | awk '{print $1}')"
+          test "$actual" = "$expected"
+          zstd -t stage2/ubuntu.img.zst
+          zstd -d -f stage2/ubuntu.img.zst -o stage2/ubuntu.img
+          test "$(stat -c %s stage2/ubuntu.img)" -eq 3600000000
+          file stage2/ubuntu.img
+
+      - name: Seed UBports extrausers credentials and skip wizard
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p stage2-mount \
+            userdata/system-data/var/lib/extrausers \
+            userdata/system-data/etc/ssh/sshd_config.d \
+            userdata/system-data/etc/systemd/system/multi-user.target.wants \
+            userdata/user-data/phablet/.config/lomiri
+          sudo mount -t ext4 -o loop,ro,noload stage2/ubuntu.img stage2-mount
+          trap 'sudo umount stage2-mount' EXIT
+
+          # On Ubuntu Touch 20.04, phablet lives in PAM extrausers,
+          # not in the ordinary /etc/shadow. Preserve all four account files.
+          for entry in passwd group shadow gshadow; do
+            test -f "stage2-mount/var/lib/extrausers/$entry"
+          done
+          sudo awk -F: '$1=="phablet" {if ($3!=32011) exit 1; found=1} END {if (!found) exit 1}' \
+            stage2-mount/var/lib/extrausers/passwd
+          sudo grep -q '^phablet:' stage2-mount/var/lib/extrausers/shadow
+
+          # An early sshd_config.d fragment can override Ubuntu's default
+          # PasswordAuthentication=no only when the main config includes it.
+          grep -Eq '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config.d/\*\.conf' \
+            stage2-mount/etc/ssh/sshd_config
+
+          sudo cp -a stage2-mount/var/lib/extrausers/. \
+            userdata/system-data/var/lib/extrausers/
+          sudo umount stage2-mount
+          trap - EXIT
+
+          printf 'Base-Name: ubuntu-sdk\nBase-Version: 20.04\n' \
+            > userdata/user-data/phablet/.config/lomiri/wizard-has-run
+
+          # Enable SSH automatically; leave authorized_keys absent.
+          ln -s /usr/lib/systemd/system/ssh.service \
+            userdata/system-data/etc/systemd/system/multi-user.target.wants/ssh.service
+          printf '%s\n' \
+            '# Password-only SSH for the local Pixel Watch 2 recovery port.' \
+            'PasswordAuthentication yes' \
+            'ChallengeResponseAuthentication no' \
+            'PubkeyAuthentication no' \
+            'PermitEmptyPasswords no' \
+            'PermitRootLogin no' \
+            'UsePAM yes' \
+            'AllowUsers phablet' \
+            > userdata/system-data/etc/ssh/sshd_config.d/00-eos-password.conf
+          sudo chown -R 32011:32011 userdata/user-data/phablet
+          test ! -e userdata/user-data/phablet/.ssh/authorized_keys
+
+      - name: Set the phablet password in PAM extrausers and make userdata.img
+        shell: bash
+        env:
+          WATCH_SSH_PASSWORD: ${{ secrets.WATCH_SSH_PASSWORD }}
+        run: |
+          set -euo pipefail
+          umask 077
+          if test -z "$WATCH_SSH_PASSWORD"; then
+            echo "::error::Configure the WATCH_SSH_PASSWORD repository Actions secret before running Stage 3."
+            exit 1
+          fi
+          if test "${#WATCH_SSH_PASSWORD}" -lt 12; then
+            echo "::error::Use a unique SSH password of at least 12 characters."
+            exit 1
+          fi
+
+          shadow_file=userdata/system-data/var/lib/extrausers/shadow
+          # phablet is authenticated through /var/lib/extrausers/shadow.
+          # The password is NEVER written to source control or workflow logs.
+          password_hash="$(printf '%s' "$WATCH_SSH_PASSWORD" | openssl passwd -6 -stdin)"
+          sudo awk -F: -v OFS=: -v new_hash="$password_hash" \
+            '$1=="phablet" {$2=new_hash; found=1} {print} END {if (!found) exit 2}' \
+            "$shadow_file" > "$RUNNER_TEMP/eos-shadow-new"
+          sudo install -o 0 -g "$(sudo stat -c %g "$shadow_file")" -m 0640 \
+            "$RUNNER_TEMP/eos-shadow-new" "$shadow_file"
+          test ! -e userdata/user-data/phablet/.ssh/authorized_keys
+          unset password_hash WATCH_SSH_PASSWORD
+
+          # The official eos README requires this ext4 feature combination.
+          sudo mkfs.ext4 -F -O '^metadata_csum,^orphan_file' -m 0 \
+            -d userdata/ userdata.img 200M
+          sudo chown "$(id -u):$(id -g)" userdata.img
+          file userdata.img
+          test "$(stat -c %s userdata.img)" -eq 209715200
+          e2fsck -fn userdata.img
+          sha256sum userdata.img > SHA256SUMS
+          printf '%s\n' \
+            "Pixel Watch 2 (eos) userdata.img, 200 MiB ext4" \
+            "For Ubuntu Touch 20.04 ARMHF Stage 2: ${{ inputs.stage2_tag }}" \
+            "Lomiri first-setup wizard marked as completed." \
+            "SSH auto-enabled for phablet; password auth only; root SSH disabled." \
+            "No client public key is needed. SSH server host keys still exist." \
+            "Contains a salted password hash: KEEP THE IMAGE PRIVATE." \
+            "WARNING: Flashing userdata.img REPLACES existing userdata." \
+            "No flashing performed by this workflow." \
+            > README-USERDATA.txt
+          ls -lh userdata.img SHA256SUMS README-USERDATA.txt
+
+      - name: Offer private temporary download of password-bearing userdata.img
+        uses: actions/upload-artifact@v4
+        with:
+          name: eos-stage3-password-userdata
+          path: |
+            userdata.img
+            SHA256SUMS
+            README-USERDATA.txt
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 6
