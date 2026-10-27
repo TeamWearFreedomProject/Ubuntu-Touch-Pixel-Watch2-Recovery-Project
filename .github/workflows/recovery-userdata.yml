@@ -10,7 +10,7 @@ on:
         default: "stage2-40430296102"
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   userdata:
@@ -37,9 +37,30 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p stage2
-          gh release download "$STAGE2_TAG" \
-            --repo "$GITHUB_REPOSITORY" \
-            --pattern 'ubuntu.img.zst' --pattern 'SHA256SUMS' --dir stage2
+          # Draft releases can lack a published Git tag. Use the authenticated
+          # REST Release Assets API rather than gh release download <tag>.
+          # The workflow token needs Contents:write to access draft listings.
+          releases="$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100")"
+          if ! jq -e --arg tag "$STAGE2_TAG" \
+              '.[] | select(.tag_name == $tag and .draft == true)' \
+              <<< "$releases" >/dev/null; then
+            echo "::error::Stage 2 draft release unavailable to this token: $STAGE2_TAG"
+            exit 1
+          fi
+          for asset_name in ubuntu.img.zst SHA256SUMS; do
+            asset_id="$(jq -er --arg tag "$STAGE2_TAG" --arg name "$asset_name" \
+              '[.[] | select(.tag_name == $tag and .draft == true) \
+              | .assets[] | select(.name == $name) | .id] | first' \
+              <<< "$releases")"
+            curl --fail --location --retry 3 --retry-delay 5 \
+              --header 'Accept: application/octet-stream' \
+              --header "Authorization: Bearer $GH_TOKEN" \
+              --header 'X-GitHub-Api-Version: 2022-11-28' \
+              --output "stage2/$asset_name" \
+              "https://api.github.com/repos/$GITHUB_REPOSITORY/releases/assets/$asset_id"
+          done
+          # Reject an API JSON response masquerading as a downloaded archive.
+          test "$(stat -c %s stage2/ubuntu.img.zst)" -gt 200000000
           test -s stage2/ubuntu.img.zst
           test -s stage2/SHA256SUMS
           expected="$(awk '$2=="out/ubuntu.img.zst" {print $1}' stage2/SHA256SUMS)"
