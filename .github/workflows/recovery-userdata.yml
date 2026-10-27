@@ -49,8 +49,7 @@ jobs:
           fi
           for asset_name in ubuntu.img.zst SHA256SUMS; do
             asset_id="$(jq -er --arg tag "$STAGE2_TAG" --arg name "$asset_name" \
-              '[.[] | select(.tag_name == $tag and .draft == true) \
-              | .assets[] | select(.name == $name) | .id] | first' \
+              '[.[] | select(.tag_name == $tag and .draft == true) | .assets[] | select(.name == $name) | .id] | first' \
               <<< "$releases")"
             curl --fail --location --retry 3 --retry-delay 5 \
               --header 'Accept: application/octet-stream' \
