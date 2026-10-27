@@ -94,6 +94,7 @@ jobs:
           mkdir -p stage2-mount \
             userdata/system-data/var/lib/extrausers \
             userdata/system-data/etc/ssh/sshd_config.d \
+            userdata/system-data/etc/pam.d \
             userdata/system-data/etc/systemd/system/multi-user.target.wants \
             userdata/user-data/phablet/.config/lomiri
           sudo mount -t ext4 -o loop,ro,noload stage2/ubuntu.img stage2-mount
@@ -111,6 +112,23 @@ jobs:
           test -f stage2-mount/lib/systemd/system/ssh.service || \
             test -f stage2-mount/usr/lib/systemd/system/ssh.service
           test -x stage2-mount/usr/bin/ssh-keygen
+
+          # PAM must allow null passwords too. Otherwise both the lock screen
+          # and OpenSSH can still reject the intentionally empty phablet hash.
+          test -f stage2-mount/etc/pam.d/common-auth
+          sudo awk '
+            {
+              if ($0 ~ /^[[:space:]]*auth[[:space:]]/ && $0 ~ /pam_extrausers[.]so/) {
+                gsub(/nullok_secure/, "nullok")
+                if ($0 !~ /nullok/) sub(/pam_extrausers[.]so/, "pam_extrausers.so nullok")
+                found=1
+              }
+              print
+            }
+            END { if (!found) exit 3 }
+          ' stage2-mount/etc/pam.d/common-auth > "$RUNNER_TEMP/common-auth-noauth"
+          sudo install -o 0 -g 0 -m 0644 "$RUNNER_TEMP/common-auth-noauth" \
+            userdata/system-data/etc/pam.d/common-auth
 
           sudo cp -a stage2-mount/var/lib/extrausers/. userdata/system-data/var/lib/extrausers/
           sudo umount stage2-mount
@@ -183,7 +201,7 @@ jobs:
           printf '%s\n' \
             "Pixel Watch 2 eos Stage 3.1 NO-AUTH SSH rescue userdata, 200MiB ext4" \
             "Stage2 base: ${{ inputs.stage2_tag }}" \
-            "No UNIX password for phablet; intended to avoid a password lock prompt." \
+            "No UNIX password for phablet; PAM extrausers common-auth permits blank logins." \
             "SSH allows blank password and no client public key; Ubuntu Touch PAM may still restrict empty logins." \
             "Unique SSH server host keys generated on the watch before ssh.service." \
             "SSH transport encryption remains mandatory; ext4 userdata is not encrypted." \
