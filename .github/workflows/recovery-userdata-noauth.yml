@@ -1,0 +1,226 @@
+name: Ubuntu Touch recovery - Stage 3.1 passwordless OPEN SSH userdata
+
+on:
+  workflow_dispatch:
+    inputs:
+      stage2_tag:
+        description: "Draft Stage 2 release tag containing ubuntu.img.zst"
+        required: true
+        type: string
+        default: "stage2-40430296102"
+      acknowledge_open_ssh:
+        description: "DANGER: anyone who can reach watch port 22 may obtain a shell without credentials"
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  userdata:
+    name: Create passwordless, unauthenticated SSH userdata.img for eos
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    steps:
+      - name: Install ext4 and zstd utilities
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends e2fsprogs zstd openssl
+          command -v gh
+          command -v mkfs.ext4
+          df -h .
+
+      - name: Recover and verify Stage 2 Ubuntu image
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          STAGE2_TAG: ${{ inputs.stage2_tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p stage2
+          # Draft releases can lack a published Git tag. Use the authenticated
+          # REST Release Assets API rather than gh release download <tag>.
+          # The workflow token needs Contents:write to access draft listings.
+          releases="$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100")"
+          if ! jq -e --arg tag "$STAGE2_TAG" \
+              '.[] | select(.tag_name == $tag and .draft == true)' \
+              <<< "$releases" >/dev/null; then
+            echo "::error::Stage 2 draft release unavailable to this token: $STAGE2_TAG"
+            exit 1
+          fi
+          for asset_name in ubuntu.img.zst SHA256SUMS; do
+            asset_id="$(jq -er --arg tag "$STAGE2_TAG" --arg name "$asset_name" \
+              '[.[] | select(.tag_name == $tag and .draft == true) | .assets[] | select(.name == $name) | .id] | first' \
+              <<< "$releases")"
+            curl --fail --location --retry 3 --retry-delay 5 \
+              --header 'Accept: application/octet-stream' \
+              --header "Authorization: Bearer $GH_TOKEN" \
+              --header 'X-GitHub-Api-Version: 2022-11-28' \
+              --output "stage2/$asset_name" \
+              "https://api.github.com/repos/$GITHUB_REPOSITORY/releases/assets/$asset_id"
+          done
+          # Reject an API JSON response masquerading as a downloaded archive.
+          test "$(stat -c %s stage2/ubuntu.img.zst)" -gt 200000000
+          test -s stage2/ubuntu.img.zst
+          test -s stage2/SHA256SUMS
+          expected="$(awk '$2=="out/ubuntu.img.zst" {print $1}' stage2/SHA256SUMS)"
+          test "${#expected}" -eq 64
+          actual="$(sha256sum stage2/ubuntu.img.zst | awk '{print $1}')"
+          test "$actual" = "$expected"
+          zstd -t stage2/ubuntu.img.zst
+          zstd -d -f stage2/ubuntu.img.zst -o stage2/ubuntu.img
+          test "$(stat -c %s stage2/ubuntu.img)" -eq 3600000000
+          file stage2/ubuntu.img
+
+      - name: Require explicit acknowledgment for unauthenticated SSH
+        shell: bash
+        env:
+          ACKNOWLEDGED: ${{ inputs.acknowledge_open_ssh }}
+        run: |
+          set -euo pipefail
+          if test "$ACKNOWLEDGED" != "true"; then
+            echo "::error::You must check acknowledge_open_ssh. Anyone on a reachable network can access the watch as phablet without credentials."
+            exit 1
+          fi
+
+      - name: Seed extrausers, skip Lomiri wizard, and enable SSH host-key generation
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p stage2-mount \
+            userdata/system-data/var/lib/extrausers \
+            userdata/system-data/etc/ssh/sshd_config.d \
+            userdata/system-data/etc/pam.d \
+            userdata/system-data/etc/systemd/system/multi-user.target.wants \
+            userdata/user-data/phablet/.config/lomiri
+          sudo mount -t ext4 -o loop,ro,noload stage2/ubuntu.img stage2-mount
+          trap 'sudo umount stage2-mount' EXIT
+
+          for entry in passwd group shadow gshadow; do
+            test -f "stage2-mount/var/lib/extrausers/$entry"
+          done
+          sudo awk -F: '$1=="phablet" {if ($3!=32011) exit 1; found=1} END {if (!found) exit 1}' \
+            stage2-mount/var/lib/extrausers/passwd
+          sudo grep -q '^phablet:' stage2-mount/var/lib/extrausers/shadow
+          grep -Eq '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config.d/\*\.conf' \
+            stage2-mount/etc/ssh/sshd_config
+          # The port README expects ssh.service and the boot rootfs must provide it.
+          test -f stage2-mount/lib/systemd/system/ssh.service || \
+            test -f stage2-mount/usr/lib/systemd/system/ssh.service
+          test -x stage2-mount/usr/bin/ssh-keygen
+
+          # PAM must allow null passwords too. Otherwise both the lock screen
+          # and OpenSSH can still reject the intentionally empty phablet hash.
+          test -f stage2-mount/etc/pam.d/common-auth
+          sudo awk '
+            {
+              if ($0 ~ /^[[:space:]]*auth[[:space:]]/ && $0 ~ /pam_extrausers[.]so/) {
+                gsub(/nullok_secure/, "nullok")
+                if ($0 !~ /nullok/) sub(/pam_extrausers[.]so/, "pam_extrausers.so nullok")
+                found=1
+              }
+              print
+            }
+            END { if (!found) exit 3 }
+          ' stage2-mount/etc/pam.d/common-auth > "$RUNNER_TEMP/common-auth-noauth"
+          sudo install -o 0 -g 0 -m 0644 "$RUNNER_TEMP/common-auth-noauth" \
+            userdata/system-data/etc/pam.d/common-auth
+
+          sudo cp -a stage2-mount/var/lib/extrausers/. userdata/system-data/var/lib/extrausers/
+          sudo umount stage2-mount
+          trap - EXIT
+
+          printf 'Base-Name: ubuntu-sdk\nBase-Version: 20.04\n' \
+            > userdata/user-data/phablet/.config/lomiri/wizard-has-run
+
+          # UBports docs require SSH host keys. Generate unique host keys on
+          # the device at boot, not in GitHub Actions artifacts or source control.
+          printf '%s\n' \
+            '[Unit]' \
+            'Description=Generate device-local SSH host keys before ssh.service' \
+            'After=local-fs.target' \
+            'Before=ssh.service' \
+            '' \
+            '[Service]' \
+            'Type=oneshot' \
+            'ExecStart=/usr/bin/ssh-keygen -A' \
+            'RemainAfterExit=yes' \
+            '' \
+            '[Install]' \
+            'WantedBy=multi-user.target' \
+            > userdata/system-data/etc/systemd/system/eos-ssh-hostkeys.service
+
+          ln -s /etc/systemd/system/eos-ssh-hostkeys.service \
+            userdata/system-data/etc/systemd/system/multi-user.target.wants/eos-ssh-hostkeys.service
+          ln -s /lib/systemd/system/ssh.service \
+            userdata/system-data/etc/systemd/system/multi-user.target.wants/ssh.service
+
+          # Intentionally INSECURE. Permit OpenSSH's "none" authentication
+          # for the phablet account, whose password field is empty.
+          printf '%s\n' \
+            '# INSECURE: passwordless local debugging; any reachable client can log in.' \
+            'PasswordAuthentication yes' \
+            'PermitEmptyPasswords yes' \
+            'ChallengeResponseAuthentication no' \
+            'PubkeyAuthentication no' \
+            'PermitRootLogin no' \
+            'UsePAM yes' \
+            'AllowUsers phablet' \
+            'DisableForwarding yes' \
+            > userdata/system-data/etc/ssh/sshd_config.d/00-eos-noauth.conf
+
+          sudo chown -R 32011:32011 userdata/user-data/phablet
+          test ! -e userdata/user-data/phablet/.ssh/authorized_keys
+
+      - name: Clear phablet UNIX password and create unencrypted ext4 userdata.img
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          shadow_file=userdata/system-data/var/lib/extrausers/shadow
+          # Blank password hash, not "!" (which would lock the account).
+          # SSH still encrypts its transport; ext4 userdata has no disk encryption.
+          sudo awk -F: -v OFS=: \
+            '$1=="phablet" {$2=""; found=1} {print} END {if (!found) exit 2}' \
+            "$shadow_file" > "$RUNNER_TEMP/eos-shadow-noauth"
+          sudo install -o 0 -g "$(sudo stat -c %g "$shadow_file")" -m 0640 \
+            "$RUNNER_TEMP/eos-shadow-noauth" "$shadow_file"
+          sudo awk -F: '$1=="phablet" {if($2 != "") exit 1; found=1} END {if(!found) exit 1}' \
+            "$shadow_file"
+
+          sudo mkfs.ext4 -F -O '^metadata_csum,^orphan_file' -m 0 \
+            -d userdata/ userdata.img 200M
+          sudo chown "$(id -u):$(id -g)" userdata.img
+          test "$(stat -c %s userdata.img)" -eq 209715200
+          e2fsck -fn userdata.img
+          sha256sum userdata.img > SHA256SUMS
+          printf '%s\n' \
+            "Pixel Watch 2 eos Stage 3.1 NO-AUTH SSH rescue userdata, 200MiB ext4" \
+            "Stage2 base: ${{ inputs.stage2_tag }}" \
+            "No UNIX password for phablet; PAM extrausers common-auth permits blank logins." \
+            "SSH allows blank password and no client public key; Ubuntu Touch PAM may still restrict empty logins." \
+            "Unique SSH server host keys generated on the watch before ssh.service." \
+            "SSH transport encryption remains mandatory; ext4 userdata is not encrypted." \
+            "WARNING: ANYONE able to reach the watch on TCP/22 can attempt shell access as phablet." \
+            "Never connect to untrusted/shared Wi-Fi, and never port-forward TCP/22." \
+            "Flashing userdata.img wipes existing watch userdata, including Wi-Fi settings." \
+            "Only the userdata image changes; do not reflash boot, init_boot, or system." \
+            "This workflow cannot prove SSH or screen-lock behavior until tested on-device." \
+            > README-USERDATA.txt
+          ls -lh userdata.img SHA256SUMS README-USERDATA.txt
+
+      - name: Upload private short-lived NO-AUTH userdata artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: eos-stage3-1-NOAUTH-UNSAFE-userdata
+          path: |
+            userdata.img
+            SHA256SUMS
+            README-USERDATA.txt
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 6
