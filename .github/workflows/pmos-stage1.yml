@@ -1,0 +1,66 @@
+name: Pixel Watch 2 postmarketOS Stage 1 - toolchain and ARM64 baseline
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  stage1:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Install tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends git python3 openssl curl ca-certificates file tar
+      - name: Check official pmbootstrap toolchain
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://gitlab.postmarketos.org/postmarketOS/pmbootstrap.git /tmp/pmbootstrap
+          python3 /tmp/pmbootstrap/pmbootstrap.py --version | tee pmbootstrap-version.txt
+          python3 /tmp/pmbootstrap/pmbootstrap.py --help > pmbootstrap-help.txt
+          python3 /tmp/pmbootstrap/pmbootstrap.py bootimg_analyze --help > bootimg-analyze-help.txt
+          git -C /tmp/pmbootstrap rev-parse HEAD > pmbootstrap-commit.txt
+      - name: Download and verify ARM64 Alpine minirootfs
+        run: |
+          set -euo pipefail
+          base=https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/aarch64
+          name=alpine-minirootfs-3.24.1-aarch64.tar.gz
+          curl -fL --retry 3 -o "$name" "$base/$name"
+          curl -fL --retry 3 -o "$name.sha256" "$base/$name.sha256"
+          sha256sum -c "$name.sha256"
+          mkdir rootfs-check
+          tar -xzf "$name" -C rootfs-check
+          test -x rootfs-check/bin/busybox
+          test -f rootfs-check/etc/alpine-release
+          cat rootfs-check/etc/alpine-release
+          file rootfs-check/bin/busybox | tee busybox-architecture.txt
+          # ELF e_machine aarch64 is 183; at offset 18 (2-byte LE).
+          test "$(od -An -t u2 -j 18 -N 2 rootfs-check/bin/busybox | tr -d ' ')" = "183"
+          mv "$name" alpine-aarch64-baseline.tar.gz
+          sha256sum alpine-aarch64-baseline.tar.gz > baseline-SHA256SUMS.txt
+      - name: Write scope note
+        run: |
+          cat > STAGE1-RESULT.txt <<'EOF'
+          Pixel Watch 2 postmarketOS Stage 1: baseline only.
+          Alpine aarch64 rootfs verified, pmbootstrap CLI available.
+          This is NOT a postmarketOS google-eos build and NOT bootable on the watch.
+          No device-specific package, kernel, initramfs or boot image yet.
+          Nothing was flashed and there is no password or USB service configured.
+          Stage 2: add a google-eos device package and inspect AsteroidOS USB configuration.
+          EOF
+      - name: Upload diagnostics and baseline
+        uses: actions/upload-artifact@v4
+        with:
+          name: eos-pmos-stage1-arm64-baseline
+          retention-days: 7
+          if-no-files-found: error
+          path: |
+            alpine-aarch64-baseline.tar.gz
+            baseline-SHA256SUMS.txt
+            pmbootstrap-version.txt
+            pmbootstrap-commit.txt
+            pmbootstrap-help.txt
+            bootimg-analyze-help.txt
+            busybox-architecture.txt
+            STAGE1-RESULT.txt
